@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>分子构象搜索协作工具</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://3dmol.org/build/3Dmol-min.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body>
+    <div id="app">
+        <header class="header">
+            <h1>🔬 分子构象搜索协作工具</h1>
+            <div class="status-bar">
+                <span :class="['connection-status', connected ? 'connected' : 'disconnected']">
+                    {{ connected ? '🟢 已连接' : '🔴 已断开' }}
+                </span>
+                <span class="session-id">会话: {{ currentSessionId || '未开始' }}</span>
+            </div>
+        </header>
+
+        <div class="main-container">
+            <aside class="sidebar">
+                <div class="panel">
+                    <h3>📝 分子输入</h3>
+                    <div class="input-group">
+                        <label>SMILES 表达式:</label>
+                        <input v-model="smilesInput" placeholder="例如: CCO (乙醇)" @input="checkForLargeRing" />
+                        <div v-if="detectedRingInfo" class="ring-info">
+                            <span class="ring-badge">🔍 检测到{{ detectedRingInfo.num_large_rings }}个大环 (最大: {{ detectedRingInfo.max_ring_size }}元环)</span>
+                        </div>
+                    </div>
+                    <div class="quick-examples">
+                        <label>快速示例:</label>
+                        <div class="example-buttons">
+                            <button @click="setSmiles('CCO')">乙醇</button>
+                            <button @click="setSmiles('c1ccccc1')">苯</button>
+                            <button @click="setSmiles('CC(=O)OC1=CC=CC=C1C(=O)O')">阿司匹林</button>
+                            <button @click="setSmiles('CN1C=NC2=C1C(=O)N(C(=O)N2C)C')">咖啡因</button>
+                        </div>
+                        <label style="margin-top: 0.5rem;">大环示例:</label>
+                        <div class="example-buttons">
+                            <button @click="setSmiles('C1CCCCCCCCCCCC1')">环十四烷</button>
+                            <button @click="setSmiles('C1COCCOCCOCCOCCO1')">15-冠-5</button>
+                            <button @click="setSmiles('C1COCCOCCOCCOCCOCCO1')">18-冠-6</button>
+                        </div>
+                    </div>
+                    <div class="input-group">
+                        <label>搜索方法:</label>
+                        <select v-model="searchMethod">
+                            <option value="etkdg">ETKDG (推荐)</option>
+                            <option value="distance_geometry">距离几何</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
+                        <label>构象数量: {{ numConformations }}</label>
+                        <input type="range" v-model="numConformations" min="5" max="50" step="5" />
+                    </div>
+                    <button class="btn-primary" @click="startSearch" :disabled="isSearching || !smilesInput">
+                        {{ isSearching ? '搜索中...' : '🚀 开始构象搜索' }}
+                    </button>
+                </div>
+
+                <div class="panel" v-if="isSearching">
+                    <h3>⏳ 搜索进度</h3>
+                    <div class="progress-bar">
+                        <div class="progress-fill" :style="{ width: searchProgress + '%' }"></div>
+                    </div>
+                    <p class="progress-text">{{ searchProgress.toFixed(1) }}% ({{ currentConformation }}/{{ totalConformations }})</p>
+                </div>
+
+                <div class="panel">
+                    <h3>🔍 构象列表</h3>
+                    <div class="conformation-list" v-if="conformations.length > 0">
+                        <div 
+                            v-for="(conf, index) in sortedConformations" 
+                            :key="conf.id"
+                            :class="['conformation-item', { selected: selectedConformation?.id === conf.id }]"
+                            @click="selectConformation(conf)"
+                        >
+                            <span class="rank">#{{ conf.rank || index + 1 }}</span>
+                            <span class="energy">能量: {{ conf.energy?.toFixed(2) || 'N/A' }}</span>
+                            <span class="votes" v-if="getVoteCount(conf.id) > 0">
+                                👍 {{ getVoteCount(conf.id) }}
+                            </span>
+                        </div>
+                    </div>
+                    <p v-else class="empty-text">暂无构象数据</p>
+                </div>
+
+                <div class="panel" v-if="bestConformation">
+                    <h3>🏆 当前最佳构象</h3>
+                    <div class="best-conformation">
+                        <p>得票数: {{ bestConformation.vote_count }}</p>
+                        <button class="btn-secondary" @click="selectConformation(bestConformation.conformation)">
+                            查看最佳构象
+                        </button>
+                    </div>
+                </div>
+            </aside>
+
+            <main class="main-content">
+                <div class="viewer-section">
+                    <div class="viewer-header">
+                        <h3>🎯 3D 分子查看器</h3>
+                        <div class="viewer-controls">
+                            <button @click="setStyle('stick')">棍状</button>
+                            <button @click="setStyle('sphere')">球状</button>
+                            <button @click="setStyle('cartoon')">卡通</button>
+                            <button @click="spinToggle">{{ spinning ? '停止旋转' : '开始旋转' }}</button>
+                            <button v-if="dockingResult" @click="toggleDockingView" :class="{ active: showDockingView }">
+                                {{ showDockingView ? '🔬 对接视图' : '💊 对接视图' }}
+                            </button>
+                        </div>
+                    </div>
+                    <div id="molviewer" class="mol-viewer"></div>
+                    <div class="conformation-info" v-if="selectedConformation && !showDockingView">
+                        <h4>构象信息</h4>
+                        <div class="info-grid">
+                            <div class="info-item">
+                                <label>能量:</label>
+                                <span>{{ selectedConformation.energy?.toFixed(2) || 'N/A' }} kJ/mol</span>
+                            </div>
+                            <div class="info-item">
+                                <label>排名:</label>
+                                <span>#{{ selectedConformation.rank }}</span>
+                            </div>
+                            <div class="info-item">
+                                <label>SMILES:</label>
+                                <span class="smiles-text">{{ selectedConformation.smiles }}</span>
+                            </div>
+                            <div class="info-item">
+                                <label>原子数:</label>
+                                <span>{{ selectedConformation.atoms?.length }}</span>
+                            </div>
+                            <div class="info-item" v-if="selectedConformation.has_large_ring">
+                                <label>大环:</label>
+                                <span class="ring-badge">是 (最大{{ selectedConformation.max_ring_size }}元环)</span>
+                            </div>
+                        </div>
+                        <div class="vote-section">
+                            <button 
+                                class="btn-vote"
+                                :class="{ voted: userVote === selectedConformation.id }"
+                                @click="vote(selectedConformation.id)"
+                            >
+                                {{ userVote === selectedConformation.id ? '👍 已投票 (取消)' : '👍 投票选择此构象' }}
+                            </button>
+                            <span class="vote-count">{{ getVoteCount(selectedConformation.id) }} 票</span>
+                        </div>
+                    </div>
+
+                    <div class="docking-info" v-if="showDockingView && selectedDockingPose">
+                        <h4>🧬 对接位姿信息</h4>
+                        <div class="info-grid">
+                            <div class="info-item">
+                                <label>对接评分:</label>
+                                <span class="docking-score">{{ selectedDockingPose.score?.toFixed(2) || 'N/A' }}</span>
+                            </div>
+                            <div class="info-item">
+                                <label>排名:</label>
+                                <span>#{{ selectedDockingPose.rank }}</span>
+                            </div>
+                            <div class="info-item">
+                                <label>碰撞数:</label>
+                                <span :class="{ 'clash-warning': selectedDockingPose.clash_count > 0 }">{{ selectedDockingPose.clash_count }}</span>
+                            </div>
+                            <div class="info-item">
+                                <label>氢键数:</label>
+                                <span class="hbond-count">{{ selectedDockingPose.hbond_count }}</span>
+                            </div>
+                            <div class="info-item">
+                                <label>配体原子:</label>
+                                <span>{{ selectedDockingPose.atoms?.length }}</span>
+                            </div>
+                            <div class="info-item">
+                                <label>受体原子:</label>
+                                <span>{{ dockingResult?.receptor_atoms?.length }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="docking-section">
+                    <h3>🧬 分子对接模拟</h3>
+                    <div class="docking-controls">
+                        <div class="docking-row">
+                            <div class="input-group">
+                                <label>受体类型:</label>
+                                <select v-model="dockingReceptor">
+                                    <option value="hydrophobic_pocket">疏水性结合口袋</option>
+                                    <option value="polar_pocket">极性结合口袋</option>
+                                    <option value="metal_binding_site">金属结合位点</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label>结合位点半径: {{ dockingRadius }} Å</label>
+                                <input type="range" v-model="dockingRadius" min="4" max="15" step="0.5" />
+                            </div>
+                        </div>
+                        <div class="docking-row">
+                            <div class="input-group">
+                                <label>输出位姿数: {{ dockingNumPoses }}</label>
+                                <input type="range" v-model="dockingNumPoses" min="1" max="20" step="1" />
+                            </div>
+                            <div class="input-group">
+                                <label>旋转采样数: {{ dockingRotations }}</label>
+                                <input type="range" v-model="dockingRotations" min="20" max="200" step="10" />
+                            </div>
+                        </div>
+                        <div class="docking-actions">
+                            <button 
+                                class="btn-dock" 
+                                @click="startDocking" 
+                                :disabled="isDocking || !selectedConformation"
+                            >
+                                {{ isDocking ? '对接中...' : '🧬 开始对接' }}
+                            </button>
+                            <button 
+                                class="btn-secondary" 
+                                @click="clearDocking" 
+                                :disabled="!dockingResult"
+                            >
+                                清除对接
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="docking-progress" v-if="isDocking">
+                        <div class="progress-bar">
+                            <div class="progress-fill docking-progress-fill" style="width: 100%"></div>
+                        </div>
+                        <p class="progress-text">正在执行刚性对接采样...</p>
+                    </div>
+
+                    <div class="docking-results" v-if="dockingResult && dockingResult.poses.length > 0">
+                        <h4>对接结果位姿</h4>
+                        <div class="pose-list">
+                            <div 
+                                v-for="pose in dockingResult.poses" 
+                                :key="pose.rank"
+                                :class="['pose-item', { selected: selectedDockingPose?.rank === pose.rank }]"
+                                @click="selectDockingPose(pose)"
+                            >
+                                <span class="pose-rank">#{{ pose.rank }}</span>
+                                <span class="pose-score">评分: {{ pose.score.toFixed(2) }}</span>
+                                <span class="pose-hbonds" v-if="pose.hbond_count > 0">🔗 {{ pose.hbond_count }}H键</span>
+                                <span class="pose-clash" v-if="pose.clash_count > 0">⚠️ {{ pose.clash_count }}碰撞</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="collaboration-section">
+                    <h3>👥 协作信息</h3>
+                    <div class="collab-info">
+                        <p>分享此会话ID给协作者: <strong>{{ currentSessionId || '等待开始...' }}</strong></p>
+                        <div class="join-session">
+                            <input v-model="joinSessionId" placeholder="输入会话ID加入协作" />
+                            <button class="btn-secondary" @click="joinSession">加入会话</button>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
